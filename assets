@@ -1,1 +1,369 @@
+/* PocketFlow - mobile-first PHP/MySQL money manager */
+(function ($) {
+  'use strict';
 
+  const csrf = $('meta[name="csrf-token"]').attr('content');
+  const COLORS = ['#6257ED', '#0C9F88', '#F2A23A', '#EF6A86', '#4689E8', '#9B6BDD'];
+  const ICONS = ['wallet2', 'briefcase', 'laptop', 'shop', 'gift', 'piggy-bank', 'bank', 'cash-stack', 'stars', 'three-dots'];
+  const CATEGORY_COLORS = ['#6257ed', '#0c9f88', '#f2a23a', '#ef6a86', '#4689e8', '#a377dc', '#78899c'];
+  const expenseCategories = ['Food & Drinks', 'Groceries', 'Transport', 'Shopping', 'Bills', 'Rent', 'Health', 'Entertainment', 'Education', 'Family', 'Savings', 'Other'];
+  const incomeCategories = ['Salary', 'Freelance', 'Business', 'Bonus', 'Gift', 'Investment', 'Refund', 'Loan', 'Other'];
+  const state = { sources: [], totals: {}, recent: [], categories: [], monthly: [], currentView: 'home', currentKind: 'all', page: 1, hasMore: false, busy: false, hideBalance: false, chart: null, lastTrigger: null };
+  const fmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  const fmtFull = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const today = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
+  const money = n => fmt.format(Number(n) || 0);
+  const fullMoney = n => fmtFull.format(Number(n) || 0);
+  const safe = s => String(s ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+  const sourceById = id => state.sources.find(s => String(s.id) === String(id));
+  let queryTimer;
+  let toastTimer;
+
+  function notify(message, isError = false) {
+    const $toast = $('#toast');
+    $toast.text(message).toggleClass('error', isError).addClass('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => $toast.removeClass('show'), 3400);
+  }
+  function apiPost(action, payload = {}) {
+    return $.ajax({ url: 'api.php', method: 'POST', dataType: 'json', data: { action, ...payload }, headers: { 'X-CSRF-Token': csrf } });
+  }
+  function errorText(xhr) {
+    if (xhr?.status === 401) { window.location.href = 'login.php'; return 'Please sign in again.'; }
+    return xhr?.responseJSON?.message || 'Unable to connect. Check that Apache and MySQL are running.';
+  }
+  function empty(heading, desc, action = '') {
+    return `<div class="empty-state"><div class="empty-glyph"><i class="bi bi-wallet2"></i></div><strong>${safe(heading)}</strong><p>${safe(desc)}</p>${action ? `<button type="button" data-sheet="${action}">+ Get started</button>` : ''}</div>`;
+  }
+  function refresh() {
+    return $.getJSON('api.php', { action: 'state' }).done(data => {
+      if (!data.ok) { notify(data.message || 'Could not load your data', true); return; }
+      Object.assign(state, { sources: data.sources, totals: data.totals, recent: data.recent, monthly: data.monthly, categories: data.categories });
+      renderAll();
+      if (state.currentView === 'activity') loadTransactions(false);
+    }).fail(xhr => notify(errorText(xhr), true));
+  }
+  function iconHtml(icon, extra = '') { return `<i class="bi bi-${safe(ICONS.includes(icon) ? icon : 'wallet2')} ${extra}"></i>`; }
+  function prettyDate(date) {
+    const d = new Date(`${date}T12:00:00`);
+    return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+  }
+  function renderAll() {
+    $('#home-income').text(money(state.totals.month_income));
+    $('#home-expense').text(money(state.totals.month_expense));
+    $('#balance-amount').text(state.hideBalance ? '••••••••' : fullMoney(state.totals.balance));
+    $('#toggle-balance i').attr('class', state.hideBalance ? 'bi bi-eye-slash' : 'bi bi-eye');
+    $('#sources-balance').text(money(state.totals.balance));
+    $('#insight-income').text(money(state.totals.all_income));
+    $('#insight-expense').text(money(state.totals.all_expense));
+    renderSources();
+    renderRecent();
+    renderCategories();
+    renderDistribution();
+    renderSourceFilter();
+    if (state.currentView === 'insights') renderChart();
+  }
+  function renderSources() {
+    const cards = state.sources.map(s => `
+      <button type="button" class="source-card" style="--source-color:${safe(s.color)}" data-open-source="${s.id}">
+        <div class="source-card-top"><span class="source-icon">${iconHtml(s.icon)}</span><i class="bi bi-arrow-up-right source-arrow"></i></div>
+        <span class="source-name">${safe(s.name)}</span>
+        <strong class="source-balance">${money(s.balance)}</strong>
+        <div class="source-micro"><span><i class="bi bi-arrow-down-left"></i> ${money(s.income_total)}</span><span><i class="bi bi-arrow-up-right"></i> ${money(s.expense_total)}</span></div>
+      </button>`).join('');
+    $('#home-sources').html(cards + '<button type="button" class="source-card add-source-card" data-sheet="source"><i class="bi bi-plus-circle"></i><strong>New income source</strong></button>');
+
+    const full = state.sources.map(s => {
+      const income = Number(s.income_total) || 0;
+      const expense = Number(s.expense_total) || 0;
+      const spentPct = income > 0 ? Math.min(100, (expense / income) * 100) : 0;
+      return `<article class="full-source" data-full-source="${s.id}" style="--source-color:${safe(s.color)}">
+        <div class="full-source-top"><span class="source-icon">${iconHtml(s.icon)}</span><div class="full-source-details"><h3>${safe(s.name)}</h3><small>Available to spend</small></div><i class="bi bi-three-dots" style="color:#b5bbca"></i></div>
+        <strong class="source-big-amount">${money(s.balance)}</strong>
+        <div class="source-progress" role="progressbar" aria-valuenow="${Math.round(spentPct)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${spentPct}%"></span></div>
+        <div class="full-source-footer"><span>Received <b>${money(s.income_total)}</b></span><span>Spent <b>${money(s.expense_total)}</b></span></div>
+        <div class="full-source-options"><button type="button" data-sheet="income" data-source="${s.id}"><i class="bi bi-plus-circle"></i>Income</button><button type="button" data-sheet="expense" data-source="${s.id}"><i class="bi bi-dash-circle"></i>Expense</button><button type="button" data-source-history="${s.id}"><i class="bi bi-clock-history"></i>History</button>${Number(s.balance) === 0 && Number(s.transaction_count) === 0 ? `<button class="source-remove" data-remove-source="${s.id}" title="Remove empty source"><i class="bi bi-trash"></i></button>` : ''}</div>
+      </article>`;
+    }).join('');
+    $('#source-full-list').html(full || empty('No income sources yet', 'Create Salary, Freelance, Business or any other pocket.', 'source'));
+  }
+  function txRow(t, withDelete = false) {
+    const transfer = t.kind.startsWith('transfer');
+    const plus = t.kind === 'income' || t.kind === 'transfer_in';
+    const cls = transfer ? 'transfer' : plus ? 'income' : 'expense';
+    const icon = transfer ? 'arrow-left-right' : plus ? 'arrow-down-left' : 'arrow-up-right';
+    const sign = plus ? '+' : '−';
+    return `<div class="transaction-row">
+      <span class="tx-icon ${cls}"><i class="bi bi-${icon}"></i></span>
+      <div class="tx-main"><strong title="${safe(t.title)}">${safe(t.title)}</strong><small>${safe(t.source_name)} · ${safe(t.category)}</small></div>
+      <div class="tx-money"><strong class="${plus ? 'plus' : 'minus'}">${sign}${money(t.amount)}</strong><small>${prettyDate(t.occurred_on)}</small></div>
+      ${withDelete ? `<button type="button" class="delete-tx" data-delete-tx="${t.id}" title="Delete and reverse transaction" aria-label="Delete ${safe(t.title)}"><i class="bi bi-trash3"></i></button>` : ''}
+    </div>`;
+  }
+  function renderRecent() {
+    $('#home-recent').html(state.recent.length ? state.recent.slice(0, 5).map(t => txRow(t)).join('') : empty('No activity yet', 'Start by adding income to one of your sources.', state.sources.length ? 'income' : 'source'));
+  }
+  function donutMarkup(data, larger = false) {
+    const sum = data.reduce((n, t) => n + Number(t.amount), 0);
+    if (!sum) return empty('Nothing spent this month', 'Expenses will appear here as you record them.');
+    let progress = 0;
+    const segments = data.map((t, i) => {
+      const start = progress;
+      progress += Number(t.amount) / sum * 100;
+      return `${CATEGORY_COLORS[i % CATEGORY_COLORS.length]} ${start}% ${progress}%`;
+    }).join(', ');
+    const chart = `<div class="donut" style="background:conic-gradient(${segments})"><div class="donut-center"><strong>${money(sum)}</strong><small>Total spent</small></div></div>`;
+    const legend = `<div class="legend-list">${data.slice(0, larger ? 7 : 4).map((t, i) => `<div class="legend-row"><span><b style="background:${CATEGORY_COLORS[i % CATEGORY_COLORS.length]}"></b>${safe(t.category)}</span><strong>${money(t.amount)}</strong></div>`).join('')}</div>`;
+    return chart + legend;
+  }
+  function renderCategories() {
+    $('#home-categories').html(donutMarkup(state.categories));
+    $('#insights-categories').html(donutMarkup(state.categories, true));
+  }
+  function renderDistribution() {
+    const total = state.sources.reduce((n, s) => n + Number(s.balance), 0);
+    if (!state.sources.length) { $('#insights-distribution').html(empty('No income sources', 'Create a source to see your balance distribution.', 'source')); return; }
+    const slices = state.sources.map((s, i) => `<span style="width:${total ? Number(s.balance) / total * 100 : 0}%;background:${safe(s.color)}"></span>`).join('');
+    const items = state.sources.map(s => `<div class="distribution-entry"><span><b style="background:${safe(s.color)}"></b>${safe(s.name)}</span><strong>${money(s.balance)}</strong></div>`).join('');
+    $('#insights-distribution').html(`<div class="distribution-track">${slices}</div>${items}`);
+  }
+  function renderSourceFilter() {
+    const $select = $('#filter-source');
+    const selected = $select.val();
+    $select.html('<option value="">All sources</option>' + state.sources.map(s => `<option value="${s.id}">${safe(s.name)}</option>`).join(''));
+    if (state.sources.some(s => String(s.id) === selected)) $select.val(selected);
+  }
+  function renderChart() {
+    const canvas = document.getElementById('flow-chart');
+    if (state.chart) { state.chart.destroy(); state.chart = null; }
+    if (!window.Chart) return;
+    const currentMonth = new Date();
+    const months = Array.from({ length: 6 }, (_, i) => {
+      const d = new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 5 + i, 1);
+      return { key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, label: d.toLocaleDateString('en-IN', { month: 'short' }) };
+    });
+    const lookup = Object.fromEntries(state.monthly.map(x => [x.month, x]));
+    state.chart = new Chart(canvas, { type: 'bar', data: { labels: months.map(m => m.label), datasets: [
+      { label: 'Income', data: months.map(m => Number(lookup[m.key]?.income || 0)), backgroundColor: '#17b998', borderRadius: 5, maxBarThickness: 18 },
+      { label: 'Expenses', data: months.map(m => Number(lookup[m.key]?.expense || 0)), backgroundColor: '#887bf6', borderRadius: 5, maxBarThickness: 18 }
+    ] }, options: { responsive: true, maintainAspectRatio: false, animation: { duration: 350 }, plugins: { legend: { display: false }, tooltip: { callbacks: { label: context => `${context.dataset.label}: ${money(context.parsed.y)}` } } }, scales: {
+      x: { grid: { display: false }, border: { display: false }, ticks: { color: '#929aaf', font: { size: 10, family: 'DM Sans' } } },
+      y: { beginAtZero: true, border: { display: false }, grid: { color: '#f1f3f8' }, ticks: { color: '#a2a9b7', font: { size: 9 }, callback: value => value >= 1000 ? `${(value / 1000).toFixed(value % 1000 === 0 ? 0 : 1)}k` : value } }
+    } } });
+  }
+  function navigate(view) {
+    if (!['home', 'sources', 'activity', 'insights'].includes(view)) return;
+    state.currentView = view;
+    $('.view').removeClass('active');
+    $(`#view-${view}`).addClass('active');
+    $('.nav-item-app').toggleClass('active', false).filter(`[data-view="${view}"]`).addClass('active');
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    if (view === 'activity') loadTransactions(false);
+    if (view === 'insights') renderChart();
+  }
+  function loadTransactions(append = false) {
+    const page = append ? state.page + 1 : 1;
+    const params = { action: 'transactions', page, source_id: $('#filter-source').val(), kind: state.currentKind, month: $('#filter-month').val(), q: $('#filter-search').val().trim() };
+    $('#load-more').prop('disabled', true);
+    if (!append) $('#activity-list').html('<div class="loading-state"><i class="bi bi-arrow-repeat"></i> Loading transactions...</div>');
+    $.getJSON('api.php', params).done(data => {
+      state.page = data.page; state.hasMore = data.has_more;
+      const markup = data.items.map(t => txRow(t, true)).join('');
+      if (append) $('#activity-list').append(markup);
+      else $('#activity-list').html(markup || empty('No matching transactions', 'Try changing your search or filters.'));
+      $('#activity-count').text(`${Math.min(data.total, data.page * 18)} of ${data.total} transactions`);
+      $('#load-more').prop('hidden', !data.has_more);
+    }).fail(xhr => { if (!append) $('#activity-list').html(empty('Unable to load transactions', errorText(xhr))); notify(errorText(xhr), true); })
+      .always(() => $('#load-more').prop('disabled', false));
+  }
+  function optionsHtml(selected = '') {
+    return state.sources.map(s => `<option value="${s.id}" ${String(s.id) === String(selected) ? 'selected' : ''}>${safe(s.name)} (${money(s.balance)})</option>`).join('');
+  }
+  function categoryHtml(kind) {
+    return (kind === 'income' ? incomeCategories : expenseCategories).map(x => `<option value="${safe(x)}">${safe(x)}</option>`).join('');
+  }
+  function transactionForm(kind, selected = '') {
+    const income = kind === 'income';
+    return `<form id="sheet-form" data-action="${kind}">
+      <div class="sheet-field"><label for="amount-input">Amount (₹)</label><input id="amount-input" inputmode="decimal" type="number" step="0.01" min="0.01" max="99999999999" name="amount" placeholder="0.00" required autofocus></div>
+      <div class="sheet-field"><label for="source-input">${income ? 'Add money to' : 'Pay from this income source'}</label><select name="source_id" id="source-input" required>${optionsHtml(selected)}</select><div class="source-balance-note" id="selected-balance"></div></div>
+      <div class="sheet-field"><label for="title-input">What is it for?</label><input id="title-input" name="title" maxlength="120" placeholder="${income ? 'e.g. October salary' : 'e.g. Grocery shopping'}" required></div>
+      <div class="sheet-two"><div class="sheet-field"><label for="category-input">Category</label><select id="category-input" name="category" required>${categoryHtml(kind)}</select></div><div class="sheet-field"><label for="entry-date">Date</label><input id="entry-date" type="date" name="date" value="${today()}" required></div></div>
+      <div class="sheet-field"><label for="entry-note">Note <span style="color:#a8afbe;font-weight:500">(optional)</span></label><textarea name="note" id="entry-note" maxlength="500" rows="2" placeholder="Anything you want to remember..."></textarea></div>
+      <button class="sheet-submit" type="submit">${income ? 'Save income' : 'Save expense'} <i class="bi bi-arrow-right"></i></button>
+      ${income ? '' : '<p class="sheet-help">Your expense will be deducted only from the selected source.</p>'}
+    </form>`;
+  }
+  function sourceForm() {
+    return `<form id="sheet-form" data-action="source">
+      <div class="sheet-field"><label for="source-name">Source name</label><input id="source-name" name="name" maxlength="80" placeholder="e.g. Salary, Freelance, Business" required autofocus></div>
+      <div class="sheet-field"><label for="opening-balance">Opening balance (₹)</label><input id="opening-balance" name="opening" inputmode="decimal" type="number" min="0" step="0.01" value="0" required></div>
+      <div class="sheet-field"><label>Choose an icon</label><div class="icon-choices">${ICONS.map((x, i) => `<label class="icon-choice"><input type="radio" name="icon" value="${x}" ${i === 0 ? 'checked' : ''}><span>${iconHtml(x)}</span></label>`).join('')}</div></div>
+      <div class="sheet-field"><label>Pick a color</label><div class="color-choices">${COLORS.map((x, i) => `<label class="color-choice" style="--choice-color:${x}"><input type="radio" name="color" value="${x}" ${i === 0 ? 'checked' : ''}><span></span></label>`).join('')}</div></div>
+      <button class="sheet-submit" type="submit">Create income source <i class="bi bi-arrow-right"></i></button>
+      <p class="sheet-help">You can add more income or record expenses after creating this source.</p>
+    </form>`;
+  }
+  function transferForm() {
+    return `<form id="sheet-form" data-action="transfer">
+      <div class="sheet-field"><label for="amount-input">Amount to transfer (₹)</label><input id="amount-input" name="amount" inputmode="decimal" type="number" step="0.01" min="0.01" placeholder="0.00" required autofocus></div>
+      <div class="sheet-field"><label for="transfer-from">From income source</label><select id="transfer-from" name="from_id" required>${optionsHtml()}</select><div class="source-balance-note" id="selected-balance"></div></div>
+      <div class="sheet-field"><label for="transfer-to">To income source</label><select id="transfer-to" name="to_id" required>${optionsHtml(state.sources[1]?.id)}</select></div>
+      <div class="sheet-two"><div class="sheet-field"><label for="transfer-date">Date</label><input id="transfer-date" type="date" name="date" value="${today()}" required></div><div class="sheet-field"><label for="transfer-note">Note (optional)</label><input id="transfer-note" name="note" maxlength="500" placeholder="e.g. Cash moved"></div></div>
+      <button class="sheet-submit" type="submit">Transfer money <i class="bi bi-arrow-left-right"></i></button>
+      <p class="sheet-help">Transfers move money between sources without counting as new income or spending.</p>
+    </form>`;
+  }
+  function actionMenu() {
+    const items = [
+      ['income', 'arrow-down-left', 'Add income', 'Add money to a selected source', 'quick-income'],
+      ['expense', 'arrow-up-right', 'Add expense', 'Deduct from one income source', 'quick-expense'],
+      ['transfer', 'arrow-left-right', 'Transfer money', 'Move between your sources', 'quick-transfer'],
+      ['source', 'plus-lg', 'New income source', 'Create another separate pocket', 'quick-transfer']
+    ];
+    return `<div class="action-options">${items.map(i => `<button class="action-option" type="button" data-sheet="${i[0]}"><span class="quick-icon ${i[4]}"><i class="bi bi-${i[1]}"></i></span><span><strong>${i[2]}</strong><small>${i[3]}</small></span><i class="bi bi-chevron-right"></i></button>`).join('')}</div>`;
+  }
+  function updateBalanceHint() {
+    const $select = $('#sheet-form [name="source_id"],#sheet-form [name="from_id"]');
+    const source = sourceById($select.val());
+    $('#selected-balance').html(source ? `Available: <strong>${money(source.balance)}</strong>` : '');
+  }
+  function openSheet(which, selectedSource = '') {
+    if ((which === 'income' || which === 'expense') && !state.sources.length) {
+      notify('First, create an income source such as Salary.');
+      which = 'source';
+    }
+    if (which === 'transfer' && state.sources.length < 2) {
+      notify('Create at least two income sources to transfer money.');
+      which = 'source';
+    }
+    const meta = {
+      action: ['WHAT WOULD YOU LIKE TO DO?', 'Add something new'],
+      source: ['CREATE A NEW POCKET', 'New income source'],
+      income: ['MONEY COMING IN', 'Add income'],
+      expense: ['MONEY GOING OUT', 'Add expense'],
+      transfer: ['BETWEEN YOUR POCKETS', 'Transfer money']
+    };
+    if (!meta[which]) return;
+    state.lastTrigger = document.activeElement;
+    $('#sheet-subtitle').text(meta[which][0]);
+    $('#sheet-title').text(meta[which][1]);
+    $('#sheet-content').html(which === 'source' ? sourceForm() : which === 'transfer' ? transferForm() : which === 'action' ? actionMenu() : transactionForm(which, selectedSource));
+    $('#sheet-overlay').addClass('open').attr('aria-hidden', 'false');
+    $('body').css('overflow', 'hidden');
+    updateBalanceHint();
+    setTimeout(() => $('#sheet-form [autofocus],.action-option').first().trigger('focus'), 90);
+  }
+  function closeSheet() {
+    $('#sheet-overlay').removeClass('open').attr('aria-hidden', 'true');
+    $('body').css('overflow', '');
+    if (state.lastTrigger && state.lastTrigger.isConnected) state.lastTrigger.focus();
+  }
+  function submitForm(e) {
+    e.preventDefault();
+    const $form = $(e.currentTarget);
+    if (state.busy) return;
+    const values = Object.fromEntries(new FormData($form[0]).entries());
+    const action = $form.data('action');
+    if (action === 'expense' || action === 'transfer') {
+      const from = sourceById(action === 'expense' ? values.source_id : values.from_id);
+      if (from && Number(values.amount) > Number(from.balance)) {
+        notify(`Only ${money(from.balance)} is available in ${from.name}.`, true);
+        return;
+      }
+    }
+    if (action === 'transfer' && values.from_id === values.to_id) { notify('Choose different sources for a transfer.', true); return; }
+    const $button = $form.find('[type="submit"]');
+    state.busy = true;
+    $button.prop('disabled', true).text('Saving...');
+    apiPost(action, values).done(response => {
+      closeSheet();
+      notify(response.message || 'Saved successfully!');
+      refresh();
+    }).fail(xhr => notify(errorText(xhr), true))
+      .always(() => { state.busy = false; $button.prop('disabled', false); });
+  }
+  function deleteTx(id) {
+    if (!window.confirm('Delete this transaction and reverse its effect on the source balance? Transfers will delete both linked entries.')) return;
+    apiPost('delete', { id }).done(response => { notify(response.message); refresh(); }).fail(xhr => notify(errorText(xhr), true));
+  }
+
+  // Navigation and actions
+  $(document).on('click', '[data-view]', function () { navigate($(this).data('view')); });
+  $(document).on('click', '[data-sheet]', function () { openSheet($(this).data('sheet'), $(this).attr('data-source') || ''); });
+  $(document).on('click', '[data-open-source]', function () { const id = $(this).attr('data-open-source'); navigate('sources'); document.querySelector(`[data-full-source="${id}"]`)?.scrollIntoView({ block: 'center' }); });
+  $(document).on('click', '[data-source-history]', function () { navigate('activity'); $('#filter-source').val($(this).attr('data-source-history')); loadTransactions(false); });
+  $(document).on('click', '[data-close-sheet]', closeSheet);
+  $(document).on('keydown', function (e) {
+    if (!$('#sheet-overlay').hasClass('open')) return;
+    if (e.key === 'Escape') closeSheet();
+    if (e.key === 'Tab') {
+      const nodes = $('#sheet-overlay .action-sheet').find('button:not(:disabled),input:not([type=hidden]),select,textarea').filter(':visible').toArray();
+      if (!nodes.length) return;
+      if (e.shiftKey && document.activeElement === nodes[0]) { nodes[nodes.length - 1].focus(); e.preventDefault(); }
+      else if (!e.shiftKey && document.activeElement === nodes[nodes.length - 1]) { nodes[0].focus(); e.preventDefault(); }
+    }
+  });
+  $(document).on('submit', '#sheet-form', submitForm);
+  $(document).on('change', '#sheet-form [name="source_id"],#sheet-form [name="from_id"]', updateBalanceHint);
+  $(document).on('click', '[data-delete-tx]', function () { deleteTx($(this).data('delete-tx')); });
+  $(document).on('click', '[data-remove-source]', function () {
+    if (!window.confirm('Remove this empty income source?')) return;
+    apiPost('delete_source', { id: $(this).data('remove-source') }).done(data => { notify(data.message); refresh(); }).fail(xhr => notify(errorText(xhr), true));
+  });
+  $('#filter-kinds').on('click', 'button', function () { $('#filter-kinds button').removeClass('active'); $(this).addClass('active'); state.currentKind = $(this).data('kind'); loadTransactions(false); });
+  $('#filter-source,#filter-month').on('change', () => loadTransactions(false));
+  $('#filter-search').on('input', function () { clearTimeout(queryTimer); queryTimer = setTimeout(() => loadTransactions(false), 280); });
+  $('#load-more').on('click', () => loadTransactions(true));
+  $('#toggle-balance').on('click', function () { state.hideBalance = !state.hideBalance; $('#balance-amount').text(state.hideBalance ? '••••••••' : fullMoney(state.totals.balance)); $('#toggle-balance i').attr('class', state.hideBalance ? 'bi bi-eye-slash' : 'bi bi-eye'); });
+  $('#top-add-source').on('click', () => openSheet('source'));
+
+  const date = new Date();
+  $('#today-pill').text(date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }));
+  const h = date.getHours();
+  $('#greeting-time').text(h < 12 ? 'morning' : h < 17 ? 'afternoon' : 'evening');
+  refresh();
+})(jQuery);
+
+.auth-body{min-height:100vh;min-height:100dvh;display:flex;justify-content:center;align-items:center;padding:20px 10px;background:linear-gradient(145deg,#e8e5fc,#f7f8fc 55%,#e9f4f3)}
+.auth-shell{width:min(100%,460px);border-radius:28px;padding:29px 25px 26px;background:#fff;box-shadow:0 20px 70px #24284d21}
+.auth-brand{display:flex;align-items:center;gap:11px;margin:0 1px 24px}
+.auth-brand strong{font:800 22px 'Manrope',sans-serif;letter-spacing:-1px}.auth-brand strong span{color:var(--primary)}
+.auth-logo{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;background:var(--primary);color:#fff;font-size:23px;transform:rotate(-8deg)}
+.auth-art{border-radius:23px;min-height:145px;padding:19px 20px;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;background:linear-gradient(125deg,#554ada,#8174f5);color:white;position:relative;overflow:hidden}
+.auth-art:after{content:'';position:absolute;border:30px solid #ffffff12;width:180px;height:180px;border-radius:50%;right:-64px;top:-66px}
+.auth-art-symbol{font-size:28px;margin-bottom:10px}.auth-art-label{max-width:235px;font:800 17px 'Manrope',sans-serif;line-height:1.5;position:relative;z-index:1}
+.auth-art-chip{font-size:10px;color:#eeebff;margin-top:10px;display:flex;gap:6px;align-items:center}
+.auth-panel{margin-top:27px}.auth-heading h1{font:800 25px 'Manrope',sans-serif;margin:7px 0;letter-spacing:-1px}.auth-heading p{color:#8791a2;font-size:12px;line-height:1.6;margin:0 0 20px}
+.auth-switch{display:grid;grid-template-columns:1fr 1fr;gap:5px;background:#f2f2f8;padding:5px;border-radius:12px;margin-bottom:20px}
+.auth-switch a{display:block;text-decoration:none;text-align:center;padding:11px 8px;border-radius:9px;color:#7e879e;font-size:12px;font-weight:800}.auth-switch a.active{background:white;color:var(--primary);box-shadow:0 2px 8px #20284c10}
+.auth-form label{font-size:11px;font-weight:800;color:#4d5871;display:block;margin:0 0 7px}
+.auth-input{display:flex;align-items:center;border:1px solid #e9ebf3;background:#fafbfe;padding:0 13px;border-radius:12px;margin-bottom:17px;gap:10px}.auth-input i{color:#9ba4b8;font-size:16px}.auth-input:focus-within{border-color:var(--primary);background:#fff}
+.auth-input input{border:0;outline:0;background:transparent;min-width:0;flex:1;height:47px;color:#2c3650;font-size:13px}.auth-input input:focus-visible{outline:none}
+.auth-submit{background:var(--primary);color:white;width:100%;border:0;border-radius:13px;font-weight:800;font-size:13px;padding:15px 12px;margin-top:5px;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 9px 20px #6257ed30}
+.auth-error{display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#b5304e;background:#fff1f4;border:1px solid #ffdae1;padding:12px;border-radius:10px;line-height:1.5}
+.auth-footnote{display:flex;gap:8px;align-items:flex-start;font-size:10px;line-height:1.5;color:#8b94a4;margin:20px 2px 0}
+@media(max-width:490px){.auth-body{padding:0;background:#fff;align-items:stretch}.auth-shell{border-radius:0;box-shadow:none;min-height:100dvh;padding:24px 23px calc(24px + env(safe-area-inset-bottom))}}
+
+:root{--ink:#17233b;--muted:#8892a5;--primary:#6257ed;--light:#f6f7fb;--line:#eff1f7;--green:#0c9f88;--red:#f2797e;--radius:20px;--font:'DM Sans',sans-serif}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{background:#e9eaf3;color:var(--ink);font-family:var(--font);-webkit-font-smoothing:antialiased;margin:0}button,input,select,textarea{font:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #938efa;outline-offset:2px}button{border:0}button:disabled{opacity:.6;cursor:not-allowed}
+.app-shell{width:min(100%,500px);min-height:100vh;min-height:100dvh;margin:0 auto;background:var(--light);position:relative;box-shadow:0 14px 70px rgba(30,40,80,.12);padding-bottom:calc(98px + env(safe-area-inset-bottom))}
+.topbar{height:91px;display:flex;align-items:center;justify-content:space-between;padding:16px 23px 12px;background:var(--light);position:sticky;top:0;z-index:8;gap:10px}.brand-lockup{display:flex;align-items:center;gap:11px}.brand-logo{height:43px;width:43px;display:grid;place-items:center;color:#fff;font-size:23px;background:var(--primary);border-radius:15px;transform:rotate(-8deg);box-shadow:0 5px 12px rgba(98,87,237,.18)}.brand-logo i{transform:rotate(8deg)}.brand-lockup strong{font:800 18px 'Manrope',sans-serif;display:block;letter-spacing:-.9px;line-height:1.3}.brand-lockup strong span{color:var(--primary)}.brand-lockup small{font-size:8px;color:var(--muted);letter-spacing:1.15px;font-weight:800}.topbar-actions{display:flex;align-items:center;gap:8px}.date-pill{font-size:11px;color:#626c81;font-weight:800;border:1px solid #e6e8f0;padding:10px 11px;border-radius:15px;background:#fff;white-space:nowrap}.round-icon{height:37px;width:37px;display:grid;place-items:center;border:1px solid #e5e8f0;color:#4a4d66;background:#fff;border-radius:13px;font-size:20px}
+main{padding:5px 22px 18px}.view{display:none;animation:fadein .2s ease}.view.active{display:block}@keyframes fadein{from{opacity:.5;transform:translateY(5px)}to{opacity:1;transform:none}}.eyebrow{font:800 9px 'Manrope',sans-serif;letter-spacing:1.8px;color:var(--primary)}.home-greeting{display:flex;justify-content:space-between;align-items:center;margin:10px 1px 21px}.home-greeting h1,.page-heading h1{font:800 26px 'Manrope',sans-serif;letter-spacing:-1.2px;margin:5px 0 0}.wave{font-size:20px;color:#ffa851}.greeting-circle{background:#eae8ff;border-radius:14px;height:40px;width:40px;display:grid;place-items:center;color:var(--primary);font-size:18px}
+.balance-card{padding:24px 24px 21px;background:linear-gradient(122deg,#4f49d1,#7165f1 55%,#8075f9);color:#fff;border-radius:24px;box-shadow:0 17px 30px -13px rgba(99,85,232,.48);position:relative;overflow:hidden}.balance-card:before{content:"";position:absolute;width:235px;height:235px;border-radius:50%;border:45px solid rgba(255,255,255,.055);right:-108px;top:-103px}.balance-card:after{content:"";position:absolute;width:190px;height:190px;border-radius:50%;border:32px solid rgba(255,255,255,.05);right:-73px;bottom:-115px}.balance-card>*{position:relative;z-index:1}.balance-top{display:flex;align-items:center;justify-content:space-between;color:#e2dfff;font-size:12px;font-weight:600}.eye-button{background:rgba(255,255,255,.16);color:#fff;height:28px;width:30px;border-radius:9px;display:grid;place-items:center}.balance-amount{font:800 clamp(27px,7.5vw,37px) 'Manrope',sans-serif;letter-spacing:-1.9px;margin:13px 0 9px;overflow-wrap:anywhere}.balance-tag{display:inline-flex;align-items:center;gap:7px;color:#eeeaff;font-size:10px;font-weight:600;background:rgba(255,255,255,.12);padding:7px 10px;border-radius:8px}.balance-stats{display:flex;justify-content:space-between;margin-top:25px;padding-top:20px;border-top:1px solid rgba(255,255,255,.24);gap:8px}.balance-stats>div{display:flex;align-items:center;gap:10px;flex:1;min-width:0}.balance-stats small{color:#dedcff;font-size:10px;display:block;margin-bottom:3px;white-space:nowrap}.balance-stats strong{font:800 14px 'Manrope',sans-serif;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.stat-icon{width:33px;height:33px;display:grid;place-items:center;flex-shrink:0;border-radius:11px;background:rgba(255,255,255,.18);font-size:16px}.stat-icon.income{color:#b8fbe5}.stat-icon.expense{color:#ffdbdb}.balance-divider{width:1px;background:rgba(255,255,255,.17);margin:2px 2px}
+.section-head{display:flex;align-items:flex-end;justify-content:space-between;margin:30px 2px 14px;gap:8px}.section-head h2{font:800 17px 'Manrope',sans-serif;letter-spacing:-.6px;margin:5px 0 0}.text-action{color:var(--primary);font-size:11px;font-weight:800;background:none;padding:6px 0;white-space:nowrap}.text-action i{margin-left:3px}
+.source-scroll{display:flex;gap:11px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;padding:1px 0 8px}.source-scroll::-webkit-scrollbar{display:none}.source-card{width:191px;min-width:191px;scroll-snap-align:start;border:1px solid #eef0f6;background:white;border-radius:19px;padding:16px 15px;text-align:left;box-shadow:0 6px 20px rgba(30,40,70,.025);position:relative;overflow:hidden;transition:transform .2s}.source-card:hover{transform:translateY(-2px)}.source-card:before{position:absolute;content:"";width:90px;height:90px;right:-35px;top:-46px;background:var(--source-color);opacity:.07;border-radius:50%}.source-card-top{display:flex;align-items:center;justify-content:space-between}.source-icon{display:grid;place-items:center;width:39px;height:39px;background:color-mix(in srgb,var(--source-color) 12%,white);color:var(--source-color);border-radius:13px;font-size:18px;flex-shrink:0}.source-arrow{font-size:16px;color:#adb3c5}.source-name{color:#727d91;font-size:12px;font-weight:700;display:block;margin:16px 0 2px}.source-balance{font:800 20px 'Manrope',sans-serif;letter-spacing:-.8px;display:block;overflow-wrap:anywhere}.source-micro{display:flex;gap:10px;margin-top:13px;padding-top:11px;border-top:1px solid #f1f2f7;color:#8790a3;font-size:9.5px;font-weight:700}.source-micro .bi-arrow-down-left{color:var(--green)}.source-micro .bi-arrow-up-right{color:var(--red)}.add-source-card{display:flex;justify-content:center;align-items:center;flex-direction:column;background:#f0eeff;color:var(--primary);border:1px dashed #bbb6fa;gap:9px}.add-source-card i{font-size:26px}.add-source-card strong{font-size:12px}
+.quick-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px}.quick-action{min-width:0;border-radius:18px;background:#fff;border:1px solid #eef0f6;display:flex;flex-direction:column;align-items:center;padding:15px 3px 14px;box-shadow:0 5px 15px rgba(30,40,70,.025);transition:transform .15s}.quick-action:active{transform:scale(.96)}.quick-icon{display:grid;place-items:center;width:46px;height:46px;border-radius:16px;font-size:20px;margin-bottom:10px}.quick-income{background:#e4f9f2;color:#0ca880}.quick-expense{background:#fff0ef;color:#f37c81}.quick-transfer{background:#ecebff;color:var(--primary)}.quick-action strong{font-size:11px;color:#263047;font-weight:800}.quick-action small{font-size:9px;margin-top:3px;color:#9ba3b3}.section-recent{margin-top:29px}.white-panel{border:1px solid #edf0f5;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 15px rgba(31,37,59,.022)}
+.transaction-row{display:flex;align-items:center;gap:11px;padding:15px 15px;border-bottom:1px solid #f1f3f8;min-width:0}.transaction-row:last-child{border-bottom:0}.tx-icon{display:grid;place-items:center;flex-shrink:0;width:42px;height:42px;border-radius:14px;background:#f4f3ff;color:var(--primary);font-size:18px}.tx-icon.expense{background:#fff1f2;color:#ef797b}.tx-icon.income{background:#eafaf4;color:#0a9e82}.tx-icon.transfer{background:#f0f0ff;color:#756ae7}.tx-main{flex:1;min-width:0}.tx-main strong{display:block;font-size:12px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tx-main small{display:block;color:#9ba4b3;font-size:10px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tx-money{text-align:right;white-space:nowrap;min-width:0}.tx-money strong{font:800 12px 'Manrope',sans-serif}.tx-money strong.plus{color:#0ca580}.tx-money strong.minus{color:#2d354e}.tx-money small{display:block;color:#a3aab7;font-size:9px;margin-top:5px}.delete-tx{width:24px;height:26px;color:#a9aec0;background:none;display:grid;place-items:center;flex-shrink:0;font-size:13px}.delete-tx:hover{color:#ec6777;background:#fff2f3;border-radius:7px}.empty-state{padding:29px 20px;text-align:center}.empty-state .empty-glyph{width:56px;height:56px;background:#efeeff;color:var(--primary);border-radius:20px;display:grid;place-items:center;font-size:24px;margin:0 auto 12px}.empty-state strong{display:block;font-size:13px}.empty-state p{font-size:11px;line-height:1.6;color:#9aa2b2;margin:8px auto 0;max-width:250px}.empty-state button{margin-top:14px;font-weight:700;font-size:11px;color:var(--primary);background:transparent}.mini-insights{display:flex;align-items:center;gap:17px;padding:17px}.donut{width:114px;height:114px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;position:relative;background:conic-gradient(#eaeaf4 0 100%)}.donut:after{content:"";position:absolute;inset:21px;background:#fff;border-radius:50%}.donut-center{z-index:1;position:relative;text-align:center}.donut-center strong{display:block;font:800 12px 'Manrope',sans-serif}.donut-center small{display:block;color:#a1a6b4;font-size:8px;margin-top:2px}.legend-list{flex:1;min-width:0}.legend-row{display:flex;gap:9px;align-items:center;justify-content:space-between;margin:10px 0;font-size:10px;color:#717a8d}.legend-row span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.legend-row span b{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}.legend-row strong{color:#384259;font-weight:800;font-size:10px}
+.bottom-nav{height:calc(77px + env(safe-area-inset-bottom));padding:8px 13px calc(8px + env(safe-area-inset-bottom));position:fixed;width:min(100%,500px);bottom:0;left:50%;transform:translateX(-50%);z-index:9;display:grid;grid-template-columns:repeat(5,1fr);align-items:center;border-top:1px solid #eceef5;background:rgba(255,255,255,.97);backdrop-filter:blur(14px);box-shadow:0 -6px 25px rgba(32,40,81,.055)}.nav-item-app{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:none;color:#a4aabb;padding:8px 0}.nav-item-app i{font-size:19px;line-height:1}.nav-item-app span{font-size:9px;font-weight:800}.nav-item-app.active{color:var(--primary)}.nav-add{display:grid;place-items:center;width:54px;height:54px;justify-self:center;background:var(--primary);color:#fff;border-radius:19px;box-shadow:0 7px 17px rgba(98,87,237,.35);font-size:26px;transform:translateY(-12px)}.nav-add:active{transform:translateY(-12px) scale(.95)}
+.page-heading{padding:19px 2px 17px}.page-heading h1{font-size:27px;margin:8px 0}.page-heading p{font-size:12px;line-height:1.7;color:#8993a5;margin:0}.summary-line{display:flex;align-items:center;justify-content:space-between;background:linear-gradient(110deg,#6055ec,#8277f7);padding:20px;border-radius:19px;color:#fff}.summary-line span{font-size:12px;color:#e5e2ff}.summary-line strong{font:800 20px 'Manrope',sans-serif;letter-spacing:-.6px}.source-actions{display:flex;gap:10px;margin:17px 0 17px}.primary-small,.secondary-small{display:inline-flex;align-items:center;justify-content:center;gap:7px;font-size:11px;font-weight:800;border-radius:12px;padding:12px 13px;white-space:nowrap}.primary-small{background:var(--primary);color:#fff;flex:1}.secondary-small{background:#eeecff;color:var(--primary);flex:1}.full-source{margin-bottom:12px;background:white;border:1px solid #eceef4;border-radius:20px;padding:17px}.full-source-top{display:flex;gap:12px;align-items:center}.full-source-details{flex:1;min-width:0}.full-source-details h3{font-size:13px;font-weight:800;margin:0 0 5px}.full-source-details small{font-size:10px;color:#a3abbb}.full-source strong.source-big-amount{display:block;font:800 21px 'Manrope',sans-serif;letter-spacing:-.6px;margin:17px 0 10px}.source-progress{height:6px;background:#f0f1f8;border-radius:9px;overflow:hidden}.source-progress span{display:block;background:var(--source-color);height:100%;border-radius:9px;max-width:100%}.full-source-footer{display:flex;justify-content:space-between;color:#8c95a7;font-size:10px;margin-top:11px}.full-source-footer b{color:#556078}.full-source-options{display:flex;gap:8px;margin-top:15px}.full-source-options button{background:#f7f7fd;color:#5e66a0;font-size:10px;font-weight:800;border-radius:9px;padding:9px 12px}.full-source-options button i{margin-right:5px}.full-source-options button:last-child{margin-left:auto}.full-source-options .source-remove{color:#e56b7e}.info-note{display:flex;gap:10px;align-items:flex-start;background:#eeecff;color:#7870b7;padding:16px;border-radius:14px;margin-top:18px;font-size:11px;line-height:1.6}.info-note i{font-size:15px}
+.activity-search{position:relative;margin:8px 0 12px}.activity-search i{position:absolute;top:50%;transform:translateY(-50%);left:15px;color:#a4adbd}.activity-search input{width:100%;border:1px solid #e9ecf4;background:#fff;border-radius:14px;height:46px;padding:0 14px 0 42px;outline:0;font-size:12px}.filter-toolbar{display:flex;gap:9px;margin-bottom:15px}.filter-select,.filter-month{appearance:none;flex:1;min-width:0;background:#fff;border:1px solid #e9ecf4;color:#617087;padding:11px 10px;border-radius:12px;font-weight:700;font-size:11px}.filter-month{max-width:169px;appearance:auto}.filter-chips{display:flex;gap:7px;overflow:auto;scrollbar-width:none;margin-bottom:15px}.filter-chips button{font-size:10px;padding:9px 15px;white-space:nowrap;border-radius:10px;background:#fff;color:#8490a5;border:1px solid #eceef5;font-weight:800}.filter-chips button.active{background:var(--primary);border-color:var(--primary);color:#fff}.history-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:14px 3px;color:#a0a8b8;font-size:11px}.history-footer .secondary-small{flex:0 0 auto}
+.insight-totals{display:grid;grid-template-columns:1fr 1fr;gap:11px}.insight-totals>div{background:white;border-radius:18px;padding:18px;border:1px solid #edf0f5;min-width:0}.insight-totals small{display:block;color:#909bad;font-size:11px;margin:12px 0 7px}.insight-totals strong{font:800 19px 'Manrope',sans-serif;overflow-wrap:anywhere}.insight-dot{display:block;width:11px;height:11px;border-radius:50%}.insight-dot.green,.chart-legend b.green{background:#10b08d}.insight-dot.coral{background:#ff8790}.chart-card{padding:19px 10px 13px}.chart-legend{display:flex;gap:14px;justify-content:flex-end;padding:0 10px 17px;color:#8d95a7;font-size:10px;font-weight:700}.chart-legend b{height:8px;width:8px;display:inline-block;border-radius:3px;margin-right:4px}.chart-legend b.purple{background:#8476f7}.chart-holder{height:211px;position:relative}.category-panel{padding:19px 14px}.category-panel .donut{height:147px;width:147px;margin:0 auto 18px}.category-panel .donut:after{inset:27px}.category-panel .donut-center strong{font-size:18px}.category-panel .donut-center small{font-size:10px}.category-panel .legend-row{font-size:12px;padding:5px 7px}.category-panel .legend-row strong{font-size:12px}.distribution-panel{padding:19px}.distribution-track{height:12px;border-radius:30px;display:flex;overflow:hidden;background:#f1f2f7;margin:8px 0 16px}.distribution-track span{height:100%}.distribution-entry{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:15px}.distribution-entry span{font-size:11px;font-weight:700;color:#697488}.distribution-entry span b{width:10px;height:10px;border-radius:3px;display:inline-block;margin-right:9px}.distribution-entry strong{font-size:12px}
+.sheet-overlay{position:fixed;inset:0;z-index:30;display:none;align-items:flex-end;justify-content:center}.sheet-overlay.open{display:flex}.sheet-backdrop{position:absolute;inset:0;background:rgba(16,22,44,.55);backdrop-filter:blur(2px)}.action-sheet{position:relative;width:min(100%,500px);background:#fff;border-radius:26px 26px 0 0;padding:12px 22px calc(21px + env(safe-area-inset-bottom));box-shadow:0 -10px 50px rgba(15,20,40,.2);animation:slideup .25s cubic-bezier(.21,.87,.25,1);max-height:91vh;max-height:91dvh;display:flex;flex-direction:column}@keyframes slideup{from{transform:translateY(35px);opacity:.5}to{transform:translateY(0);opacity:1}}.sheet-handle{display:block;width:40px;height:5px;border-radius:5px;background:#e6e7ec;margin:0 auto 19px}.sheet-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}.sheet-head small{color:var(--primary);font-size:9px;letter-spacing:1.5px;font-weight:800}.sheet-head h2{font:800 21px 'Manrope',sans-serif;letter-spacing:-.8px;margin:4px 0 0}.sheet-close{height:35px;width:35px;border-radius:12px;background:#f4f5fa;color:#6b7187}.sheet-content{overflow-y:auto;min-height:0;overscroll-behavior:contain;padding-bottom:4px}.sheet-field{margin-bottom:15px}.sheet-field label{display:block;font-size:11px;font-weight:800;color:#566176;margin-bottom:7px}.sheet-field input,.sheet-field select,.sheet-field textarea{width:100%;border:1px solid #e9ebf3;background:#fafbfe;border-radius:12px;outline:none;padding:12px 13px;color:#34415a;font-size:13px}.sheet-field input:focus,.sheet-field select:focus,.sheet-field textarea:focus{border-color:var(--primary);background:#fff}.sheet-field textarea{min-height:72px;resize:vertical}.sheet-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.source-balance-note{margin-top:7px;color:#878fa4;font-size:11px}.source-balance-note strong{color:var(--green)}.sheet-submit{width:100%;padding:15px 12px;background:var(--primary);border-radius:14px;color:#fff;font-size:13px;font-weight:800;margin:8px 0 1px;box-shadow:0 5px 15px #6257ed3d}.sheet-submit i{margin-left:8px}.sheet-help{font-size:10px;color:#9ba4b6;text-align:center;line-height:1.5;margin:12px 0 0}.icon-choices,.color-choices{display:flex;flex-wrap:wrap;gap:9px}.icon-choice,.color-choice{cursor:pointer;position:relative}.icon-choice input,.color-choice input{position:absolute;opacity:0;width:1px;height:1px}.icon-choice span{display:grid;place-items:center;width:46px;height:46px;border-radius:12px;background:#f4f5fa;color:#8590a5;border:2px solid transparent;font-size:18px}.icon-choice input:checked+span{background:#eeecff;border-color:var(--primary);color:var(--primary)}.color-choice span{display:block;width:32px;height:32px;border-radius:50%;background:var(--choice-color);border:4px solid #fff;box-shadow:0 0 0 1px #e7e9f0}.color-choice input:checked+span{box-shadow:0 0 0 2px var(--choice-color)}.action-options{display:grid;gap:10px;padding-bottom:12px}.action-option{display:flex;align-items:center;gap:14px;width:100%;background:#fafbff;padding:14px;border:1px solid #eff1f6;border-radius:15px;text-align:left}.action-option>i{font-size:17px;color:#a0a6b3;margin-left:auto}.action-option span strong{display:block;font-size:12px;color:#28334e}.action-option span small{font-size:10px;color:#99a3b3;display:block;margin-top:3px}.action-option .quick-icon{margin:0;height:43px;width:43px}.app-toast{position:fixed;z-index:55;left:50%;top:20px;transform:translate(-50%,-20px);background:#252b43;color:#fff;border-radius:13px;font-size:12px;box-shadow:0 10px 32px #20253b44;padding:12px 16px;width:min(calc(100% - 28px),420px);text-align:center;opacity:0;pointer-events:none;transition:.2s}.app-toast.show{opacity:1;transform:translate(-50%,0)}.app-toast.error{background:#d54c67}.loading-state{text-align:center;padding:26px;color:#8e97a9;font-size:12px}
+@media(max-width:355px){.topbar{padding-left:15px;padding-right:15px}.date-pill{display:none}main{padding-left:14px;padding-right:14px}.balance-card{padding:20px 17px}.balance-stats{gap:5px}.balance-stats>div{gap:5px}.balance-stats strong{font-size:12px}.quick-actions{gap:6px}.quick-action strong{font-size:10px}.tx-main strong{font-size:11px}}
+@media(min-width:700px){body{padding:30px 0}.app-shell{min-height:calc(100vh - 60px);border-radius:30px;overflow:clip;padding-bottom:115px}.topbar{position:static}.bottom-nav{border-radius:0 0 24px 24px}.action-sheet{border-radius:25px;max-height:90vh;margin-bottom:3vh}.sheet-overlay{align-items:flex-end}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
+
+/* Multi-user account menu */
+.logout-form{margin:0}.logout-button{display:flex;align-items:center;gap:6px;background:#fff;color:#667187;padding:9px 11px;border-radius:12px;border:1px solid #e8eaf3;font-size:10px;font-weight:800}.logout-button i{font-size:16px;color:#7269d9}.greeting-user{color:#6257ed;display:inline-block;max-width:300px;overflow-wrap:anywhere}
+@media(max-width:399px){.logout-button{padding:9px}.logout-button span{display:none}.brand-lockup{gap:8px}.brand-lockup small{letter-spacing:.55px}.topbar-actions{gap:5px}.round-icon{width:35px;height:35px}}
